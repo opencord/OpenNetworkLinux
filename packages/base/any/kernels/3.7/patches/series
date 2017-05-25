@@ -1,0 +1,14 @@
+overlayfs.patch
+driver-at24-fix-odd-length-two-byte-access.patch
+driver-i2c-bus-intel-ismt-add-delay-param.patch
+driver-support-sff-8436-eeprom.patch
+driver-support-sff-8436-eeprom-update.patch
+driver-igb-version-5.3.54.patch
+driver-support-intel-igb-bcm5461X-phy.patch
+driver-i2c-bus-intel-ismt-enable-param.patch
+drivers-i2c-busses-i2c-isch-probe-param.patch
+drivers-i2c-muxes-pca954x-deselect-on-exit.patch
+driver-early-dma-allocator.patch
+drivers-gpio-config-arch-nr-gpios.patch
+drivers-net-ethernet-broadcom-tg3-preamble-reset.patch
+driver-support-intel-igb-bcm50210-phy.patch
