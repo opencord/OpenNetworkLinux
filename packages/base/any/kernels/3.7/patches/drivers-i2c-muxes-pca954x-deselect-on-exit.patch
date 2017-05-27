@@ -1,0 +1,41 @@
+diff --git a/drivers/i2c/muxes/Kconfig b/drivers/i2c/muxes/Kconfig
+index a0edd98..a68e20b 100644
+--- a/drivers/i2c/muxes/Kconfig
++++ b/drivers/i2c/muxes/Kconfig
+@@ -37,6 +37,13 @@ config I2C_MUX_PCA954x
+ 	  This driver can also be built as a module.  If so, the module
+ 	  will be called i2c-mux-pca954x.
+ 
++config I2C_MUX_PCA954X_DESELECT_ON_EXIT
++	bool "Enable deselect-on-exit feature for PCA954X devices."
++	depends on I2C_MUX_PCA954x
++	help
++	  If you say yes here you enable the deselect-on-exit feature in
++	  the pca954x i2c driver.
++
+ config I2C_MUX_PINCTRL
+ 	tristate "pinctrl-based I2C multiplexer"
+ 	depends on PINCTRL
+diff --git a/drivers/i2c/muxes/i2c-mux-pca954x.c b/drivers/i2c/muxes/i2c-mux-pca954x.c
+index 8e43872..18e3278 100644
+--- a/drivers/i2c/muxes/i2c-mux-pca954x.c
++++ b/drivers/i2c/muxes/i2c-mux-pca954x.c
+@@ -189,6 +189,9 @@ static int pca954x_probe(struct i2c_client *client,
+ 	int num, force, class;
+ 	struct pca954x *data;
+ 	int ret = -ENODEV;
++#ifdef CONFIG_I2C_MUX_PCA954X_DESELECT_ON_EXIT
++    int deselect_on_exit = 1;
++#endif
+ 
+ 	if (!i2c_check_functionality(adap, I2C_FUNC_SMBUS_BYTE))
+ 		goto err;
+@@ -230,7 +233,7 @@ static int pca954x_probe(struct i2c_client *client,
+ 		data->virt_adaps[num] =
+ 			i2c_add_mux_adapter(adap, &client->dev, client,
+ 				force, num, class, pca954x_select_chan,
+-				(pdata && pdata->modes[num].deselect_on_exit)
++				(pdata && pdata->modes[num].deselect_on_exit) || deselect_on_exit
+ 					? pca954x_deselect_mux : NULL);
+ 
+ 		if (data->virt_adaps[num] == NULL) {

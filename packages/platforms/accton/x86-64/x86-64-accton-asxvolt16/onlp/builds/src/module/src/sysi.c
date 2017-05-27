@@ -32,16 +32,19 @@
 #include <onlp/platformi/thermali.h>
 #include <onlp/platformi/fani.h>
 #include <onlp/platformi/psui.h>
+#include "platform_lib.h"
 
 #include "x86_64_accton_asxvolt16_int.h"
 #include "x86_64_accton_asxvolt16_log.h"
 
-#include "platform_lib.h"
+#define CPLD_VERSION_FORMAT			"/sys/bus/i2c/devices/%s/version"
+#define NUM_OF_CPLD         		2
 
-#define NUM_OF_THERMAL_ON_MAIN_BROAD  0
-#define NUM_OF_FAN_ON_MAIN_BROAD      0
-#define NUM_OF_PSU_ON_MAIN_BROAD      0
-#define NUM_OF_LED_ON_MAIN_BROAD      0
+static char* cpld_path[NUM_OF_CPLD] =
+{
+ "11-0060",
+ "12-0062"
+};
 
 const char*
 onlp_sysi_platform_get(void)
@@ -52,6 +55,16 @@ onlp_sysi_platform_get(void)
 int
 onlp_sysi_onie_data_get(uint8_t** data, int* size)
 {
+    uint8_t* rdata = aim_zmalloc(256);
+    if(onlp_file_read(rdata, 256, size, IDPROM_PATH) == ONLP_STATUS_OK) {
+        if(*size == 256) {
+            *data = rdata;
+            return ONLP_STATUS_OK;
+        }
+    }
+
+    aim_free(rdata);
+    *size = 0;
     return ONLP_STATUS_E_INTERNAL;
 }
 
@@ -61,34 +74,52 @@ onlp_sysi_oids_get(onlp_oid_t* table, int max)
     int i;
     onlp_oid_t* e = table;
     memset(table, 0, max*sizeof(onlp_oid_t));
-
-    /* 4 Thermal sensors on the chassis */
-    for (i = 1; i <= NUM_OF_THERMAL_ON_MAIN_BROAD; i++)
-    {
+    
+    /* 5 Thermal sensors on the chassis */
+    for (i = 1; i <= CHASSIS_THERMAL_COUNT; i++) {
         *e++ = ONLP_THERMAL_ID_CREATE(i);
     }
 
     /* 5 LEDs on the chassis */
-    for (i = 1; i <= NUM_OF_LED_ON_MAIN_BROAD; i++)
-    {
+    for (i = 1; i <= CHASSIS_LED_COUNT; i++) {
         *e++ = ONLP_LED_ID_CREATE(i);
     }
 
     /* 2 PSUs on the chassis */
-    for (i = 1; i <= NUM_OF_PSU_ON_MAIN_BROAD; i++)
-    {
+    for (i = 1; i <= CHASSIS_PSU_COUNT; i++) {
         *e++ = ONLP_PSU_ID_CREATE(i);
     }
 
-    /* 4 Fans on the chassis */
-    for (i = 1; i <= NUM_OF_FAN_ON_MAIN_BROAD; i++)
-    {
+    /* 6 Fans on the chassis */
+    for (i = 1; i <= CHASSIS_FAN_COUNT; i++) {
         *e++ = ONLP_FAN_ID_CREATE(i);
     }
 
     return 0;
 }
 
+int
+onlp_sysi_platform_info_get(onlp_platform_info_t* pi)
+{
+    int   i, v[NUM_OF_CPLD] = {0};
+
+    for (i=0; i < AIM_ARRAYSIZE(cpld_path); i++) {
+        v[i] = 0;
+
+        if(onlp_file_read_int(v+i, CPLD_VERSION_FORMAT , cpld_path[i]) < 0) {
+            return ONLP_STATUS_E_INTERNAL;
+        }
+    }
+
+    pi->cpld_versions = aim_fstrdup("%d.%d", v[0], v[1]);
+    return ONLP_STATUS_OK;
+}
+
+void
+onlp_sysi_platform_info_free(onlp_platform_info_t* pi)
+{
+    aim_free(pi->cpld_versions);
+}
 
 int
 onlp_sysi_platform_manage_fans(void)

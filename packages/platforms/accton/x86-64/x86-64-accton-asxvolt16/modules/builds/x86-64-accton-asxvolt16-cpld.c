@@ -50,7 +50,7 @@ static ssize_t show_cpld_version(struct device *dev, struct device_attribute *at
 	val = i2c_smbus_read_byte_data(client, CPLD_VERSION_REG);
 
     if (val < 0) {
-        dev_dbg(&client->dev, "cpld(0x%x) reg(0x%x) err %d\n", client->addr, CPLD_VERSION_REG);
+        dev_dbg(&client->dev, "cpld(0x%x) reg(0x%x) err %d\n", client->addr, CPLD_VERSION_REG, val);
     }
 	
     return sprintf(buf, "%d\n", val);
