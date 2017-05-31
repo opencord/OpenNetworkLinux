@@ -258,7 +258,8 @@ static struct sfp_port_data *sfp_update_present(struct i2c_client *client)
 	struct sfp_port_data *data = i2c_get_clientdata(client);
 	int i = 0;
 	int status = -1;
-	u8 regs[] = {0x09, 0x10, 0x25};
+	u8 regs[] = {0x05, 0x07, 0x25};
+	int reg_values[3] = {0};
 
 	DEBUG_PRINT("Starting sfp present status update");
 	mutex_lock(&data->update_lock);
@@ -275,8 +276,29 @@ static struct sfp_port_data *sfp_update_present(struct i2c_client *client)
         }
         
 		DEBUG_PRINT("Present status = 0x%lx", data->present);		
-        data->present |= (u64)status << (i*8);
+        //data->present |= (u64)status << (i*8);
+        reg_values[i] = status;
     }
+
+    data->present |= (reg_values[1]  & 0x40) >> 6;  /* port 0 */
+    data->present |= (reg_values[1]  & 0x80) >> 6;  /* port 1 */
+    data->present |= (reg_values[0]  & 0x10) >> 2;  /* port 2 */
+    data->present |= (reg_values[0]  & 0x20) >> 2;  /* port 3 */
+    data->present |= (reg_values[0]  & 0x04) << 2;  /* port 4 */
+    data->present |= (reg_values[0]  & 0x08) << 2;  /* port 5 */
+    data->present |= (reg_values[0]  & 0x01) << 6;  /* port 6 */
+    data->present |= (reg_values[0]  & 0x02) << 6;  /* port 7 */
+
+    data->present |= (reg_values[0]  & 0x40) << 2;  /* port 8 */
+    data->present |= (reg_values[0]  & 0x80) << 2;  /* port 9 */
+    data->present |= (reg_values[1]  & 0x01) << 10;  /* port 10 */
+    data->present |= (reg_values[1]  & 0x02) << 10;  /* port 11 */
+    data->present |= (reg_values[1]  & 0x04) << 10;  /* port 12 */
+    data->present |= (reg_values[1]  & 0x08) << 10;  /* port 13 */
+    data->present |= (reg_values[1]  & 0x10) << 10;  /* port 14 */
+    data->present |= (reg_values[1]  & 0x20) << 10;  /* port 15 */
+
+    data->present |= (reg_values[2]  & 0xF) << 16;  /* port 16 ~ 19 */
 
 	data->present &= 0xFFFFF;
 	DEBUG_PRINT("Present status = 0x%lx", data->present);
