@@ -27,8 +27,11 @@
 #include <linux/slab.h>
 #include <linux/list.h>
 #include <linux/dmi.h>
+#include <linux/delay.h>
 
 #define CPLD_VERSION_REG	0x2
+#define I2C_RW_RETRY_COUNT		10
+#define I2C_RW_RETRY_INTERVAL	60 /* ms */
 
 static LIST_HEAD(cpld_client_list);
 static struct mutex	 list_lock;
@@ -161,7 +164,7 @@ int asxvolt16_cpld_read(unsigned short cpld_addr, u8 reg)
 {
 	struct list_head   *list_node = NULL;
 	struct cpld_client_node *cpld_node = NULL;
-	int ret = -EPERM;
+	int ret = -EIO;
 	
 	mutex_lock(&list_lock);
 
@@ -170,7 +173,18 @@ int asxvolt16_cpld_read(unsigned short cpld_addr, u8 reg)
 		cpld_node = list_entry(list_node, struct cpld_client_node, list);
 		
 		if (cpld_node->client->addr == cpld_addr) {
+			int retry = I2C_RW_RETRY_COUNT;
+			
+			while (retry) {
 			ret = i2c_smbus_read_byte_data(cpld_node->client, reg);
+				if (unlikely(ret < 0)) {
+					msleep(I2C_RW_RETRY_INTERVAL);
+					retry--;
+					continue;
+				}
+				break;
+			}
+			
 			break;
 		}
 	}
@@ -194,7 +208,18 @@ int asxvolt16_cpld_write(unsigned short cpld_addr, u8 reg, u8 value)
 		cpld_node = list_entry(list_node, struct cpld_client_node, list);
 		
 		if (cpld_node->client->addr == cpld_addr) {
+			int retry = I2C_RW_RETRY_COUNT;
+			
+			while (retry) {
 			ret = i2c_smbus_write_byte_data(cpld_node->client, reg, value);
+				if (unlikely(ret < 0)) {
+					msleep(I2C_RW_RETRY_INTERVAL);
+					retry--;
+					continue;
+				}
+				break;
+			}
+
 			break;
 		}
 	}

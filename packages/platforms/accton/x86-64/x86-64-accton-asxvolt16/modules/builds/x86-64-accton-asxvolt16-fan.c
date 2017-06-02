@@ -29,6 +29,7 @@
 #include <linux/sysfs.h>
 #include <linux/slab.h>
 #include <linux/dmi.h>
+#include <linux/delay.h>
 
 #define DRVNAME "asxvolt16_fan"
 
@@ -199,15 +200,43 @@ static struct attribute *asxvolt16_fan_attributes[] = {
 #define FAN_DUTY_CYCLE_REG_MASK         0xF
 #define FAN_MAX_DUTY_CYCLE              100
 #define FAN_REG_VAL_TO_SPEED_RPM_STEP   100
+#define I2C_RW_RETRY_COUNT				10
+#define I2C_RW_RETRY_INTERVAL			60 /* ms */
 
 static int asxvolt16_fan_read_value(struct i2c_client *client, u8 reg)
 {
-    return i2c_smbus_read_byte_data(client, reg);
+	int status = 0, retry = I2C_RW_RETRY_COUNT;
+
+	while (retry) {
+		status = i2c_smbus_read_byte_data(client, reg);
+		if (unlikely(status < 0)) {
+			msleep(I2C_RW_RETRY_INTERVAL);
+			retry--;
+			continue;
+		}
+
+		break;
+	}
+
+    return status;
 }
 
 static int asxvolt16_fan_write_value(struct i2c_client *client, u8 reg, u8 value)
 {
-    return i2c_smbus_write_byte_data(client, reg, value);
+	int status = 0, retry = I2C_RW_RETRY_COUNT;
+
+	while (retry) {
+		status = i2c_smbus_write_byte_data(client, reg, value);
+		if (unlikely(status < 0)) {
+			msleep(I2C_RW_RETRY_INTERVAL);
+			retry--;
+			continue;
+		}
+
+		break;
+	}
+
+    return status;
 }
 
 /* fan utility functions

@@ -48,8 +48,8 @@
 #define EEPROM_SIZE				256	/*	256 byte eeprom */
 #define BIT_INDEX(i)			(1ULL << (i))
 #define USE_I2C_BLOCK_READ 		1 /* Platform dependent */
-#define I2C_RW_RETRY_COUNT		3
-#define I2C_RW_RETRY_INTERVAL	100 /* ms */
+#define I2C_RW_RETRY_COUNT		10
+#define I2C_RW_RETRY_INTERVAL	60 /* ms */
 
 #define SFP_EEPROM_A0_I2C_ADDR (0xA0 >> 1)
 #define SFP_EEPROM_A2_I2C_ADDR (0xA2 >> 1)

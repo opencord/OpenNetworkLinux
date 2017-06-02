@@ -30,8 +30,11 @@
 #include <linux/mutex.h>
 #include <linux/sysfs.h>
 #include <linux/slab.h>
+#include <linux/delay.h>
 
 #define MAX_FAN_DUTY_CYCLE 100
+#define I2C_RW_RETRY_COUNT		10
+#define I2C_RW_RETRY_INTERVAL	60 /* ms */
 
 /* Addresses scanned
  */
@@ -500,35 +503,75 @@ static struct i2c_driver ym2651y_driver = {
 
 static int ym2651y_read_byte(struct i2c_client *client, u8 reg)
 {
-	return i2c_smbus_read_byte_data(client, reg);
+	int status = 0, retry = I2C_RW_RETRY_COUNT;
+
+	while (retry) {
+		status = i2c_smbus_read_byte_data(client, reg);
+		if (unlikely(status < 0)) {
+			msleep(I2C_RW_RETRY_INTERVAL);
+			retry--;
+			continue;
+		}
+
+		break;
+	}
+
+    return status;
 }
 
 static int ym2651y_read_word(struct i2c_client *client, u8 reg)
 {
-	return i2c_smbus_read_word_data(client, reg);
+	int status = 0, retry = I2C_RW_RETRY_COUNT;
+
+	while (retry) {
+		status = i2c_smbus_read_word_data(client, reg);
+		if (unlikely(status < 0)) {
+			msleep(I2C_RW_RETRY_INTERVAL);
+			retry--;
+			continue;
+		}
+
+		break;
+	}
+
+    return status;
 }
 
 static int ym2651y_write_word(struct i2c_client *client, u8 reg, u16 value)
 {
-	return i2c_smbus_write_word_data(client, reg, value);
+	int status = 0, retry = I2C_RW_RETRY_COUNT;
+
+	while (retry) {
+		status = i2c_smbus_write_word_data(client, reg, value);
+		if (unlikely(status < 0)) {
+			msleep(I2C_RW_RETRY_INTERVAL);
+			retry--;
+			continue;
+		}
+
+		break;
+	}
+
+    return status;
 }
 
 static int ym2651y_read_block(struct i2c_client *client, u8 command, u8 *data,
 			  int data_len)
 {
-	int result = i2c_smbus_read_i2c_block_data(client, command, data_len, data);
+	int status = 0, retry = I2C_RW_RETRY_COUNT;
 
-	if (unlikely(result < 0))
-		goto abort;
-	if (unlikely(result != data_len)) {
-		result = -EIO;
-		goto abort;
+	while (retry) {
+		status = i2c_smbus_read_i2c_block_data(client, command, data_len, data);
+		if (unlikely(status < 0)) {
+			msleep(I2C_RW_RETRY_INTERVAL);
+			retry--;
+			continue;
 	}
 
-	result = 0;
+		break;
+	}
 
-abort:
-	return result;
+    return status;
 }
 
 struct reg_data_byte {
