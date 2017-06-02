@@ -1254,7 +1254,8 @@ static ssize_t sff_8436_page_legal(struct sfp_port_data *port_data,
 			"page_legal, SFP, off %lld len %ld\n",
 			off, (long int) len);
 	} 
-	else if (port_data->driver_type == DRIVER_TYPE_QSFP) {
+	else if (port_data->driver_type == DRIVER_TYPE_QSFP ||
+		     port_data->driver_type == DRIVER_TYPE_XFP) {
 		/* QSFP case */
 		/* if no pages needed, we're good */
 		if ((off + len) <= SFF_8436_EEPROM_UNPAGED_SIZE) return len;
@@ -1528,7 +1529,7 @@ static int xfp_probe(struct i2c_client *client, const struct i2c_device_id *dev_
 
 	/* init eeprom */
 #if (MULTIPAGE_SUPPORT == 1)
-	status = sfp_sysfs_eeprom_init(&client->dev.kobj, &xfp->eeprom.bin, SFF_8472_EEPROM_SIZE);
+	status = sfp_sysfs_eeprom_init(&client->dev.kobj, &xfp->eeprom.bin, SFF_8436_EEPROM_SIZE);
 #else
 	status = sfp_sysfs_eeprom_init(&client->dev.kobj, &xfp->eeprom.bin);
 #endif
@@ -1537,7 +1538,7 @@ static int xfp_probe(struct i2c_client *client, const struct i2c_device_id *dev_
 	}
 
 	*data = xfp;
-	dev_info(&client->dev, "sfp xfp '%s'\n", client->name);
+	dev_info(&client->dev, "xfp '%s'\n", client->name);
 
 	return 0;
 
