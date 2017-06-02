@@ -152,7 +152,8 @@ onlp_psui_info_get(onlp_oid_t id, onlp_psu_info_t* info)
     }
 
     if (val != PSU_STATUS_POWER_GOOD) {
-        info->status |=  ONLP_PSU_STATUS_FAILED;
+		info->status |= ONLP_PSU_STATUS_UNPLUGGED;
+		return ONLP_STATUS_OK;
     }
 
 
