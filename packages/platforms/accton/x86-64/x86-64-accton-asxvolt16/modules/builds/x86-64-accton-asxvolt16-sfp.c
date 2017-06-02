@@ -69,6 +69,62 @@
 #define SFF8436_TX_FAULT_ADDR				4
 #define SFF8436_TX_DISABLE_ADDR				86
 
+#define MULTIPAGE_SUPPORT		1
+
+#if (MULTIPAGE_SUPPORT == 1)
+/* fundamental unit of addressing for SFF_8472/SFF_8436 */
+#define SFF_8436_PAGE_SIZE 128
+/* 
+ * The current 8436 (QSFP) spec provides for only 4 supported
+ * pages (pages 0-3).  
+ * This driver is prepared to support more, but needs a register in the 
+ * EEPROM to indicate how many pages are supported before it is safe
+ * to implement more pages in the driver.
+ */
+#define SFF_8436_SPECED_PAGES 4
+#define SFF_8436_EEPROM_SIZE ((1 + SFF_8436_SPECED_PAGES) * SFF_8436_PAGE_SIZE)
+#define SFF_8436_EEPROM_UNPAGED_SIZE (2 * SFF_8436_PAGE_SIZE)
+/* 
+ * The current 8472 (SFP) spec provides for only 3 supported 
+ * pages (pages 0-2).
+ * This driver is prepared to support more, but needs a register in the 
+ * EEPROM to indicate how many pages are supported before it is safe
+ * to implement more pages in the driver.
+ */
+#define SFF_8472_SPECED_PAGES 3
+#define SFF_8472_EEPROM_SIZE ((3 + SFF_8472_SPECED_PAGES) * SFF_8436_PAGE_SIZE)
+#define SFF_8472_EEPROM_UNPAGED_SIZE (4 * SFF_8436_PAGE_SIZE)
+
+/* a few constants to find our way around the EEPROM */
+#define SFF_8436_PAGE_SELECT_REG   0x7F
+#define SFF_8436_PAGEABLE_REG 0x02
+#define SFF_8436_NOT_PAGEABLE (1<<2)
+#define SFF_8472_PAGEABLE_REG 0x40
+#define SFF_8472_PAGEABLE (1<<4)
+
+/*
+ * This parameter is to help this driver avoid blocking other drivers out
+ * of I2C for potentially troublesome amounts of time. With a 100 kHz I2C
+ * clock, one 256 byte read takes about 1/43 second which is excessive;
+ * but the 1/170 second it takes at 400 kHz may be quite reasonable; and
+ * at 1 MHz (Fm+) a 1/430 second delay could easily be invisible.
+ *
+ * This value is forced to be a power of two so that writes align on pages.
+ */
+static unsigned io_limit = SFF_8436_PAGE_SIZE;
+
+/*
+ * specs often allow 5 msec for a page write, sometimes 20 msec;
+ * it's important to recover from write timeouts.
+ */
+static unsigned write_timeout = 25;
+
+typedef enum qsfp_opcode {
+	QSFP_READ_OP = 0,
+	QSFP_WRITE_OP = 1
+} qsfp_opcode_e;
+#endif
+
 static ssize_t show_port_number(struct device *dev, struct device_attribute *da, char *buf);
 static ssize_t show_present(struct device *dev, struct device_attribute *da, char *buf);
 static ssize_t sfp_show_tx_rx_status(struct device *dev, struct device_attribute *da, char *buf);
@@ -211,6 +267,23 @@ struct eeprom_data {
 	struct bin_attribute bin;			/* eeprom data */
 };
 
+struct sfp_msa_data {
+	char			valid;			/* !=0 if registers are valid */
+	unsigned long	last_updated;	/* In jiffies */
+	u64				status[6];		/* bit0:port0, bit1:port1 and so on */
+									/* index 0 => tx_fail
+											 1 => tx_disable
+											 2 => rx_loss
+											 3 => device id
+											 4 => 10G Ethernet Compliance Codes
+												  to distinguish SFP or SFP+
+											 5 => DIAGNOSTIC MONITORING TYPE */
+	struct eeprom_data		eeprom;
+#if (MULTIPAGE_SUPPORT == 1)
+	struct i2c_client	   *ddm_client;	/* dummy client instance for 0xA2 */
+#endif
+};
+
 struct xfp_data {
 	char			valid;			/* !=0 if registers are valid */
 	unsigned long	last_updated;	/* In jiffies */
@@ -238,12 +311,22 @@ struct sfp_port_data {
 	int					   port;		/* CPLD port index */
 	u64					   present;		/* present status, bit0:port0, bit1:port1 and so on */
 
+	struct sfp_msa_data	  *msa;
 	struct xfp_data	  	  *xfp;
 	struct qsfp_data	  *qsfp;
 
 	struct i2c_client	  *client;
+#if (MULTIPAGE_SUPPORT == 1)
+	int use_smbus;
+	u8 *writebuf;
+	unsigned write_max;
+#endif
 };
 
+#if (MULTIPAGE_SUPPORT == 1)
+static ssize_t sfp_port_read_write(struct sfp_port_data *port_data,
+		char *buf, loff_t off, size_t len, qsfp_opcode_e opcode);
+#endif
 static ssize_t show_port_number(struct device *dev, struct device_attribute *da,
 			 char *buf)
 {
@@ -323,7 +406,7 @@ static struct sfp_port_data *sfp_update_tx_rx_status(struct device *dev)
 	data->xfp->valid = 0;
 	memset(data->xfp->status, 0, sizeof(data->xfp->status));
 
-	/* Read status of port 16(XFP port) */
+	/* Read status of port 1~16(XFP port) */
 	for (j = 0; j < 4; j++) {
 		u8 reg = 0x11 + j*2;	  
 
@@ -737,7 +820,11 @@ static ssize_t sfp_bin_write(struct file *filp, struct kobject *kobj,
 		return -ENODEV;
 	}
 
+#if (MULTIPAGE_SUPPORT == 1)
+	return sfp_port_read_write(data, buf, off, count, QSFP_WRITE_OP);
+#else
 	return sfp_port_write(data, buf, off, count);
+#endif
 }
 
 static ssize_t sfp_eeprom_read(struct i2c_client *client, u8 command, u8 *data,
@@ -800,6 +887,504 @@ abort:
 #endif
 }
 
+#if (MULTIPAGE_SUPPORT == 1)
+/*-------------------------------------------------------------------------*/
+/*
+ * This routine computes the addressing information to be used for
+ * a given r/w request.
+ *
+ * Task is to calculate the client (0 = i2c addr 50, 1 = i2c addr 51),
+ * the page, and the offset.
+ *
+ * Handles both SFP and QSFP.  
+ *     For SFP, offset 0-255 are on client[0], >255 is on client[1]
+ *     Offset 256-383 are on the lower half of client[1]
+ *     Pages are accessible on the upper half of client[1].
+ *     Offset >383 are in 128 byte pages mapped into the upper half
+ *
+ *     For QSFP, all offsets are on client[0]
+ *     offset 0-127 are on the lower half of client[0] (no paging)
+ *     Pages are accessible on the upper half of client[1].
+ *     Offset >127 are in 128 byte pages mapped into the upper half
+ *
+ *     Callers must not read/write beyond the end of a client or a page
+ *     without recomputing the client/page.  Hence offset (within page)
+ *     plus length must be less than or equal to 128.  (Note that this
+ *     routine does not have access to the length of the call, hence 
+ *     cannot do the validity check.)
+ *
+ * Offset within Lower Page 00h and Upper Page 00h are not recomputed
+ */
+static uint8_t sff_8436_translate_offset(struct sfp_port_data *port_data,
+		loff_t *offset, struct i2c_client **client)
+{
+	unsigned page = 0;
+
+	*client = port_data->client;
+
+	/* if SFP style, offset > 255, shift to i2c addr 0x51 */
+	if (port_data->driver_type == DRIVER_TYPE_SFP_MSA) {
+		if (*offset > 255) {
+			/* like QSFP, but shifted to client[1] */
+			*client = port_data->msa->ddm_client;
+			*offset -= 256;  
+		}
+	}
+
+	/*
+	 * if offset is in the range 0-128...
+	 * page doesn't matter (using lower half), return 0.
+	 * offset is already correct (don't add 128 to get to paged area)
+	 */
+	if (*offset < SFF_8436_PAGE_SIZE)
+		return page;
+
+	/* note, page will always be positive since *offset >= 128 */
+	page = (*offset >> 7)-1;
+	/* 0x80 places the offset in the top half, offset is last 7 bits */
+	*offset = SFF_8436_PAGE_SIZE + (*offset & 0x7f);
+
+	return page;  /* note also returning client and offset */
+}
+
+static ssize_t sff_8436_eeprom_read(struct sfp_port_data *port_data,
+		    struct i2c_client *client,
+		    char *buf, unsigned offset, size_t count)
+{
+	struct i2c_msg msg[2];
+	u8 msgbuf[2];
+	unsigned long timeout, read_time;
+	int status, i;
+
+	memset(msg, 0, sizeof(msg));
+
+	switch (port_data->use_smbus) {
+	case I2C_SMBUS_I2C_BLOCK_DATA:
+		/*smaller eeproms can work given some SMBus extension calls */
+		if (count > I2C_SMBUS_BLOCK_MAX)
+			count = I2C_SMBUS_BLOCK_MAX;
+		break;
+	case I2C_SMBUS_WORD_DATA:
+		/* Check for odd length transaction */
+		count = (count == 1) ? 1 : 2;
+		break;
+	case I2C_SMBUS_BYTE_DATA:
+		count = 1;
+		break;
+	default:
+		/*
+		 * When we have a better choice than SMBus calls, use a
+		 * combined I2C message. Write address; then read up to
+		 * io_limit data bytes.  msgbuf is u8 and will cast to our
+		 * needs.
+		 */
+		i = 0;
+		msgbuf[i++] = offset;
+
+		msg[0].addr = client->addr;
+		msg[0].buf = msgbuf;
+		msg[0].len = i;
+
+		msg[1].addr = client->addr;
+		msg[1].flags = I2C_M_RD;
+		msg[1].buf = buf;
+		msg[1].len = count;
+	}
+
+	/*
+	 * Reads fail if the previous write didn't complete yet. We may
+	 * loop a few times until this one succeeds, waiting at least
+	 * long enough for one entire page write to work.
+	 */
+	timeout = jiffies + msecs_to_jiffies(write_timeout);
+	do {
+		read_time = jiffies;
+
+		switch (port_data->use_smbus) {
+		case I2C_SMBUS_I2C_BLOCK_DATA:
+			status = i2c_smbus_read_i2c_block_data(client, offset,
+					count, buf);
+			break;
+		case I2C_SMBUS_WORD_DATA:
+			status = i2c_smbus_read_word_data(client, offset);
+			if (status >= 0) {
+				buf[0] = status & 0xff;
+				if (count == 2)
+					buf[1] = status >> 8;
+				status = count;
+			}
+			break;
+		case I2C_SMBUS_BYTE_DATA:
+			status = i2c_smbus_read_byte_data(client, offset);
+			if (status >= 0) {
+				buf[0] = status;
+				status = count;
+			}
+			break;
+		default:
+			status = i2c_transfer(client->adapter, msg, 2);
+			if (status == 2)
+				status = count;
+		}
+
+		dev_dbg(&client->dev, "eeprom read %zu@%d --> %d (%ld)\n",
+				count, offset, status, jiffies);
+
+		if (status == count)  /* happy path */
+			return count;
+
+		if (status == -ENXIO) /* no module present */
+			return status;
+
+		/* REVISIT: at HZ=100, this is sloooow */
+		msleep(1);
+	} while (time_before(read_time, timeout));
+
+	return -ETIMEDOUT;
+}
+
+static ssize_t sff_8436_eeprom_write(struct sfp_port_data *port_data,
+		    		struct i2c_client *client,
+				const char *buf,
+				unsigned offset, size_t count)
+{
+	struct i2c_msg msg;
+	ssize_t status;
+	unsigned long timeout, write_time;
+	unsigned next_page_start;
+	int i = 0;
+
+	/* write max is at most a page
+	 * (In this driver, write_max is actually one byte!)
+	 */
+	if (count > port_data->write_max)
+		count = port_data->write_max;
+
+	/* shorten count if necessary to avoid crossing page boundary */
+	next_page_start = roundup(offset + 1, SFF_8436_PAGE_SIZE);
+	if (offset + count > next_page_start)
+		count = next_page_start - offset;
+
+	switch (port_data->use_smbus) {
+	case I2C_SMBUS_I2C_BLOCK_DATA:
+		/*smaller eeproms can work given some SMBus extension calls */
+		if (count > I2C_SMBUS_BLOCK_MAX)
+			count = I2C_SMBUS_BLOCK_MAX;
+		break;
+	case I2C_SMBUS_WORD_DATA:
+		/* Check for odd length transaction */
+		count = (count == 1) ? 1 : 2;
+		break;
+	case I2C_SMBUS_BYTE_DATA:
+		count = 1;
+		break;
+	default:
+		/* If we'll use I2C calls for I/O, set up the message */
+		msg.addr = client->addr;
+		msg.flags = 0;
+
+		/* msg.buf is u8 and casts will mask the values */
+		msg.buf = port_data->writebuf;
+
+		msg.buf[i++] = offset;
+		memcpy(&msg.buf[i], buf, count);
+		msg.len = i + count;
+		break;
+	}
+
+	/*
+	 * Reads fail if the previous write didn't complete yet. We may
+	 * loop a few times until this one succeeds, waiting at least
+	 * long enough for one entire page write to work.
+	 */
+	timeout = jiffies + msecs_to_jiffies(write_timeout);
+	do {
+		write_time = jiffies;
+
+		switch (port_data->use_smbus) {
+		case I2C_SMBUS_I2C_BLOCK_DATA:
+			status = i2c_smbus_write_i2c_block_data(client,
+						offset, count, buf);
+			if (status == 0)
+				status = count;
+			break;
+		case I2C_SMBUS_WORD_DATA:
+			if (count == 2) {
+				status = i2c_smbus_write_word_data(client,
+					offset, (u16)((buf[0])|(buf[1] << 8)));
+			} else {
+				/* count = 1 */
+				status = i2c_smbus_write_byte_data(client,
+					offset, buf[0]);
+			}
+			if (status == 0)
+				status = count;
+			break;
+		case I2C_SMBUS_BYTE_DATA:
+			status = i2c_smbus_write_byte_data(client, offset,
+						buf[0]);
+			if (status == 0)
+				status = count;
+			break;
+		default:
+			status = i2c_transfer(client->adapter, &msg, 1);
+			if (status == 1)
+				status = count;
+			break;
+		}
+
+		dev_dbg(&client->dev, "eeprom write %zu@%d --> %ld (%lu)\n",
+				count, offset, (long int) status, jiffies);
+
+		if (status == count)
+			return count;
+
+		/* REVISIT: at HZ=100, this is sloooow */
+		msleep(1);
+	} while (time_before(write_time, timeout));
+
+	return -ETIMEDOUT;
+}
+
+
+static ssize_t sff_8436_eeprom_update_client(struct sfp_port_data *port_data,
+				char *buf, loff_t off, 
+				size_t count, qsfp_opcode_e opcode)
+{
+	struct i2c_client *client;
+	ssize_t retval = 0;
+	u8 page = 0;
+	loff_t phy_offset = off;
+	int ret = 0;
+
+	page = sff_8436_translate_offset(port_data, &phy_offset, &client);
+
+	dev_dbg(&client->dev,
+			"sff_8436_eeprom_update_client off %lld  page:%d phy_offset:%lld, count:%ld, opcode:%d\n",
+			off, page, phy_offset, (long int) count, opcode);
+	if (page > 0) {
+		ret = sff_8436_eeprom_write(port_data, client, &page, 
+			SFF_8436_PAGE_SELECT_REG, 1);
+		if (ret < 0) {
+			dev_dbg(&client->dev,
+				"Write page register for page %d failed ret:%d!\n",
+					page, ret);
+			return ret;
+		}
+	}
+
+	while (count) {
+		ssize_t	status;
+
+		if (opcode == QSFP_READ_OP) {
+			status =  sff_8436_eeprom_read(port_data, client,
+				buf, phy_offset, count);
+		} else {
+			status =  sff_8436_eeprom_write(port_data, client,
+				buf, phy_offset, count);
+		}
+		if (status <= 0) {
+			if (retval == 0)
+				retval = status;
+			break;
+		}
+		buf += status;
+		phy_offset += status;
+		count -= status;
+		retval += status;
+	}
+
+
+	if (page > 0) {
+		/* return the page register to page 0 (why?) */
+		page = 0;
+		ret = sff_8436_eeprom_write(port_data, client, &page, 
+			SFF_8436_PAGE_SELECT_REG, 1);
+		if (ret < 0) {
+			dev_err(&client->dev,
+				"Restore page register to page %d failed ret:%d!\n",
+					page, ret);
+			return ret;
+		}
+	}
+	return retval;
+}
+
+
+/*
+ * Figure out if this access is within the range of supported pages.
+ * Note this is called on every access because we don't know if the
+ * module has been replaced since the last call.
+ * If/when modules support more pages, this is the routine to update
+ * to validate and allow access to additional pages.
+ *
+ * Returns updated len for this access:
+ *     - entire access is legal, original len is returned.
+ *     - access begins legal but is too long, len is truncated to fit.
+ *     - initial offset exceeds supported pages, return -EINVAL
+ */
+static ssize_t sff_8436_page_legal(struct sfp_port_data *port_data, 
+		loff_t off, size_t len)
+{
+	struct i2c_client *client = port_data->client;
+	u8 regval;
+	int status;
+	size_t maxlen;
+
+	if (off < 0) return -EINVAL;
+	if (port_data->driver_type == DRIVER_TYPE_SFP_MSA) {
+		/* SFP case */
+		/* if no pages needed, we're good */
+		if ((off + len) <= SFF_8472_EEPROM_UNPAGED_SIZE) return len;
+		/* if offset exceeds possible pages, we're not good */
+		if (off >= SFF_8472_EEPROM_SIZE) return -EINVAL;
+		/* in between, are pages supported? */
+		status = sff_8436_eeprom_read(port_data, client, &regval, 
+				SFF_8472_PAGEABLE_REG, 1);
+		if (status < 0) return status;  /* error out (no module?) */
+		if (regval & SFF_8472_PAGEABLE) {
+			/* Pages supported, trim len to the end of pages */
+			maxlen = SFF_8472_EEPROM_SIZE - off;
+		} else {
+			/* pages not supported, trim len to unpaged size */
+			maxlen = SFF_8472_EEPROM_UNPAGED_SIZE - off;
+		}
+		len = (len > maxlen) ? maxlen : len;
+		dev_dbg(&client->dev,
+			"page_legal, SFP, off %lld len %ld\n",
+			off, (long int) len);
+	} 
+	else if (port_data->driver_type == DRIVER_TYPE_QSFP) {
+		/* QSFP case */
+		/* if no pages needed, we're good */
+		if ((off + len) <= SFF_8436_EEPROM_UNPAGED_SIZE) return len;
+		/* if offset exceeds possible pages, we're not good */
+		if (off >= SFF_8436_EEPROM_SIZE) return -EINVAL;
+		/* in between, are pages supported? */
+		status = sff_8436_eeprom_read(port_data, client, &regval, 
+				SFF_8436_PAGEABLE_REG, 1);
+		if (status < 0) return status;  /* error out (no module?) */
+		if (regval & SFF_8436_NOT_PAGEABLE) {
+			/* pages not supported, trim len to unpaged size */
+			maxlen = SFF_8436_EEPROM_UNPAGED_SIZE - off;
+		} else {
+			/* Pages supported, trim len to the end of pages */
+			maxlen = SFF_8436_EEPROM_SIZE - off;
+		}
+		len = (len > maxlen) ? maxlen : len;
+		dev_dbg(&client->dev,
+			"page_legal, QSFP, off %lld len %ld\n",
+			off, (long int) len);
+	}
+	else {
+		return -EINVAL;
+	}
+	return len;
+}
+
+
+static ssize_t sfp_port_read_write(struct sfp_port_data *port_data,
+		char *buf, loff_t off, size_t len, qsfp_opcode_e opcode)
+{
+	struct i2c_client *client = port_data->client;
+	int chunk;
+	int status = 0;
+	ssize_t retval;
+	size_t pending_len = 0, chunk_len = 0;
+	loff_t chunk_offset = 0, chunk_start_offset = 0;
+
+	if (unlikely(!len))
+		return len;
+
+	/*
+	 * Read data from chip, protecting against concurrent updates
+	 * from this host, but not from other I2C masters.
+	 */
+	mutex_lock(&port_data->update_lock);
+	
+	/*
+	 * Confirm this access fits within the device suppored addr range 
+	 */
+	len = sff_8436_page_legal(port_data, off, len);
+	if (len < 0) {
+		status = len;
+		goto err;
+	}
+
+	/*
+	 * For each (128 byte) chunk involved in this request, issue a
+	 * separate call to sff_eeprom_update_client(), to
+	 * ensure that each access recalculates the client/page
+	 * and writes the page register as needed.
+	 * Note that chunk to page mapping is confusing, is different for 
+	 * QSFP and SFP, and never needs to be done.  Don't try!
+	 */
+	pending_len = len; /* amount remaining to transfer */
+	retval = 0;  /* amount transferred */
+	for (chunk = off >> 7; chunk <= (off + len - 1) >> 7; chunk++) {
+
+		/*
+		 * Compute the offset and number of bytes to be read/write
+		 *
+		 * 1. start at offset 0 (within the chunk), and read/write
+		 *    the entire chunk
+		 * 2. start at offset 0 (within the chunk) and read/write less
+		 *    than entire chunk
+		 * 3. start at an offset not equal to 0 and read/write the rest
+		 *    of the chunk
+		 * 4. start at an offset not equal to 0 and read/write less than
+		 *    (end of chunk - offset)
+		 */
+		chunk_start_offset = chunk * SFF_8436_PAGE_SIZE;
+
+		if (chunk_start_offset < off) {
+			chunk_offset = off;
+			if ((off + pending_len) < (chunk_start_offset +
+					SFF_8436_PAGE_SIZE))
+				chunk_len = pending_len;
+			else
+				chunk_len = (chunk+1)*SFF_8436_PAGE_SIZE - off;/*SFF_8436_PAGE_SIZE - off;*/
+		} else {
+			chunk_offset = chunk_start_offset;
+			if (pending_len > SFF_8436_PAGE_SIZE)
+				chunk_len = SFF_8436_PAGE_SIZE;
+			else
+				chunk_len = pending_len;
+		}
+
+		dev_dbg(&client->dev,
+			"sff_r/w: off %lld, len %ld, chunk_start_offset %lld, chunk_offset %lld, chunk_len %ld, pending_len %ld\n",
+			off, (long int) len, chunk_start_offset, chunk_offset,
+			(long int) chunk_len, (long int) pending_len);
+
+		/* 
+		 * note: chunk_offset is from the start of the EEPROM, 
+		 * not the start of the chunk 
+		 */
+		status = sff_8436_eeprom_update_client(port_data, buf, 
+				chunk_offset, chunk_len, opcode);
+		if (status != chunk_len) {
+			/* This is another 'no device present' path */
+			dev_dbg(&client->dev, 
+	"sff_8436_update_client for chunk %d chunk_offset %lld chunk_len %ld failed %d!\n",
+				chunk, chunk_offset, (long int) chunk_len, status);
+			goto err;
+		}
+		buf += status;
+		pending_len -= status;
+		retval += status;
+	}
+	mutex_unlock(&port_data->update_lock);
+
+	return retval;
+
+err:
+	mutex_unlock(&port_data->update_lock);
+
+	return status;
+}
+
+#else
 static ssize_t sfp_port_read(struct sfp_port_data *data,
 				char *buf, loff_t off, size_t count)
 {
@@ -837,6 +1422,7 @@ static ssize_t sfp_port_read(struct sfp_port_data *data,
 	return retval;
 
 }
+#endif
 
 static ssize_t sfp_bin_read(struct file *filp, struct kobject *kobj,
 		struct bin_attribute *attr,
@@ -857,10 +1443,18 @@ static ssize_t sfp_bin_read(struct file *filp, struct kobject *kobj,
 		return -ENODEV;
 	}
 
+#if (MULTIPAGE_SUPPORT == 1)
+	return sfp_port_read_write(data, buf, off, count, QSFP_READ_OP);
+#else
 	return sfp_port_read(data, buf, off, count);
+#endif
 }
 
+#if (MULTIPAGE_SUPPORT == 1)
+static int sfp_sysfs_eeprom_init(struct kobject *kobj, struct bin_attribute *eeprom, size_t size)
+#else
 static int sfp_sysfs_eeprom_init(struct kobject *kobj, struct bin_attribute *eeprom)
+#endif
 {
 	int err;
 
@@ -869,7 +1463,11 @@ static int sfp_sysfs_eeprom_init(struct kobject *kobj, struct bin_attribute *eep
 	eeprom->attr.mode = S_IWUSR | S_IRUGO;
 	eeprom->read	  = sfp_bin_read;
 	eeprom->write	  = sfp_bin_write;
+#if (MULTIPAGE_SUPPORT == 1)
+	eeprom->size	  = size;
+#else
 	eeprom->size	  = EEPROM_SIZE;
+#endif
 
 	/* Create eeprom file */
 	err = sysfs_create_bin_file(kobj, eeprom);
@@ -886,6 +1484,8 @@ static int sfp_sysfs_eeprom_cleanup(struct kobject *kobj, struct bin_attribute *
 	return 0;
 }
 
+
+#if (MULTIPAGE_SUPPORT == 0)
 static int sfp_i2c_check_functionality(struct i2c_client *client)
 {
 #if USE_I2C_BLOCK_READ
@@ -894,6 +1494,8 @@ static int sfp_i2c_check_functionality(struct i2c_client *client)
 	return i2c_check_functionality(client->adapter, I2C_FUNC_SMBUS_BYTE_DATA);
 #endif
 }
+#endif
+
 
 static const struct attribute_group xfp_group = {
 	.attrs = xfp_attributes,
@@ -905,10 +1507,12 @@ static int xfp_probe(struct i2c_client *client, const struct i2c_device_id *dev_
 	int status;
 	struct xfp_data *xfp;
 
+#if (MULTIPAGE_SUPPORT == 0)
 	if (!sfp_i2c_check_functionality(client)) {
 		status = -EIO;
 		goto exit;
 	}
+#endif
 
 	xfp = kzalloc(sizeof(struct xfp_data), GFP_KERNEL);
 	if (!xfp) {
@@ -923,7 +1527,11 @@ static int xfp_probe(struct i2c_client *client, const struct i2c_device_id *dev_
 	}
 
 	/* init eeprom */
+#if (MULTIPAGE_SUPPORT == 1)
+	status = sfp_sysfs_eeprom_init(&client->dev.kobj, &xfp->eeprom.bin, SFF_8472_EEPROM_SIZE);
+#else
 	status = sfp_sysfs_eeprom_init(&client->dev.kobj, &xfp->eeprom.bin);
+#endif
 	if (status) {
 		goto exit_remove;
 	}
@@ -952,10 +1560,12 @@ static int qsfp_probe(struct i2c_client *client, const struct i2c_device_id *dev
 	int status;
 	struct qsfp_data *qsfp;
 
+#if (MULTIPAGE_SUPPORT == 0)
 	if (!sfp_i2c_check_functionality(client)) {
 		status = -EIO;
 		goto exit;
 	}
+#endif
 
 	qsfp = kzalloc(sizeof(struct qsfp_data), GFP_KERNEL);
 	if (!qsfp) {
@@ -970,7 +1580,11 @@ static int qsfp_probe(struct i2c_client *client, const struct i2c_device_id *dev
 	}
 
 	/* init eeprom */
+#if (MULTIPAGE_SUPPORT == 1)
+	status = sfp_sysfs_eeprom_init(&client->dev.kobj, &qsfp->eeprom.bin, SFF_8436_EEPROM_SIZE);
+#else
 	status = sfp_sysfs_eeprom_init(&client->dev.kobj, &qsfp->eeprom.bin);
+#endif
 	if (status) {
 		goto exit_remove;
 	}
@@ -1005,6 +1619,67 @@ static int sfp_device_probe(struct i2c_client *client,
 		return -ENOMEM;
 	}
 
+#if (MULTIPAGE_SUPPORT == 1)
+	data->use_smbus = 0;
+
+	/* Use I2C operations unless we're stuck with SMBus extensions. */
+	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C)) {
+		if (i2c_check_functionality(client->adapter,
+				I2C_FUNC_SMBUS_READ_I2C_BLOCK)) {
+			data->use_smbus = I2C_SMBUS_I2C_BLOCK_DATA;
+		} else if (i2c_check_functionality(client->adapter,
+				I2C_FUNC_SMBUS_READ_WORD_DATA)) {
+			data->use_smbus = I2C_SMBUS_WORD_DATA;
+		} else if (i2c_check_functionality(client->adapter,
+				I2C_FUNC_SMBUS_READ_BYTE_DATA)) {
+			data->use_smbus = I2C_SMBUS_BYTE_DATA;
+		} else {
+			ret = -EPFNOSUPPORT;
+			goto exit_kfree;
+		}
+	}
+
+	if (!data->use_smbus ||
+			(i2c_check_functionality(client->adapter,
+				I2C_FUNC_SMBUS_WRITE_I2C_BLOCK)) ||
+			i2c_check_functionality(client->adapter,
+				I2C_FUNC_SMBUS_WRITE_WORD_DATA) ||
+			i2c_check_functionality(client->adapter,
+				I2C_FUNC_SMBUS_WRITE_BYTE_DATA)) {
+		/*
+		 * NOTE: AN-2079
+		 * Finisar recommends that the host implement 1 byte writes
+		 * only since this module only supports 32 byte page boundaries.
+		 * 2 byte writes are acceptable for PE and Vout changes per
+		 * Application Note AN-2071.
+		 */
+		unsigned write_max = 1;
+
+		if (write_max > io_limit)
+			write_max = io_limit;
+		if (data->use_smbus && write_max > I2C_SMBUS_BLOCK_MAX)
+			write_max = I2C_SMBUS_BLOCK_MAX;
+		data->write_max = write_max;
+
+		/* buffer (data + address at the beginning) */
+		data->writebuf = kmalloc(write_max + 2, GFP_KERNEL);
+		if (!data->writebuf) {
+			ret = -ENOMEM;
+			goto exit_kfree;
+		}
+	} else {
+			dev_warn(&client->dev,
+				"cannot write due to controller restrictions.");
+	}
+
+	if (data->use_smbus == I2C_SMBUS_WORD_DATA ||
+	    data->use_smbus == I2C_SMBUS_BYTE_DATA) {
+		dev_notice(&client->dev, "Falling back to %s reads, "
+			   "performance will suffer\n", data->use_smbus ==
+			   I2C_SMBUS_WORD_DATA ? "word" : "byte");
+	}
+#endif
+
 	i2c_set_clientdata(client, data);
 	mutex_init(&data->update_lock);
 	data->port	 = dev_id->driver_data;
@@ -1020,10 +1695,15 @@ static int sfp_device_probe(struct i2c_client *client,
 	}
 
 	if (ret < 0) {
-		goto exit_kfree;
+		goto exit_kfree_buf;
 	}
 
 	return ret;
+
+exit_kfree_buf:
+#if (MULTIPAGE_SUPPORT == 1)
+	if (data->writebuf) kfree(data->writebuf);
+#endif
 
 exit_kfree:
 	kfree(data);
@@ -1049,16 +1729,24 @@ static int qsfp_remove(struct i2c_client *client, struct qsfp_data *data)
 
 static int sfp_device_remove(struct i2c_client *client)
 {
+	int ret = 0;
 	struct sfp_port_data *data = i2c_get_clientdata(client);
 
 	switch (data->driver_type) {
 		case DRIVER_TYPE_XFP:
-			return xfp_remove(client, data->xfp);
+			ret = xfp_remove(client, data->xfp);
+			break;
 		case DRIVER_TYPE_QSFP:
-			return qsfp_remove(client, data->qsfp);
+			ret = qsfp_remove(client, data->qsfp);
+			break;
 	}
 
-	return 0;
+#if (MULTIPAGE_SUPPORT == 1)
+	if (data->writebuf)
+		kfree(data->writebuf);
+#endif
+	kfree(data);
+	return ret;
 }
 
 /* Addresses scanned
