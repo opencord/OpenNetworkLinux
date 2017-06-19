@@ -1,2 +1,4 @@
 overlayfs.patch
 drivers-i2c-muxes-pca954x-deselect-on-exit.patch
+drivers-net-ethernet-broadcom-tg3-3.137k-version.patch
+drivers-net-ethernet-broadcom-tg3-preamble-reset.patch
