@@ -68,19 +68,6 @@ if [ "$1" != "now" ]; then
 fi
 
 #
-# Apply any network settings indicated in the boot-config.
-#
-msg_info "Configuring Interfaces"
-
-if ! /bin/ifup; then
-    msg_error "The network settings indicated in the boot-config could not be applied."
-    echo $(cat /etc/onl/NET)
-    echo
-    tryagain
-fi
-
-
-#
 # Bootmode selection.
 #
 if [ ! -f /etc/onl/BOOTMODE ]; then
@@ -96,6 +83,18 @@ fi
 
 BOOTMODE=$(echo $BOOTMODE | tr '[:upper:]' '[:lower:]')
 msg_info "BOOTMODE is $BOOTMODE."
+
+#
+# Apply any network settings indicated in the boot-config.
+#
+msg_info "Configuring Interfaces"
+
+if ! /bin/ifup; then
+    msg_error "The network settings indicated in the boot-config could not be applied."
+    echo $(cat /etc/onl/NET)
+    echo
+    [ "$BOOTMODE" != "installed" ] && tryagain
+fi
 
 if [ -f "/bootmodes/$BOOTMODE" ]; then
     "/bootmodes/$BOOTMODE"
