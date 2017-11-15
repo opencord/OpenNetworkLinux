@@ -121,10 +121,177 @@ onlp_sysi_platform_info_free(onlp_platform_info_t* pi)
     aim_free(pi->cpld_versions);
 }
 
+#define FAN_DUTY_MAX  (100)
+#define FAN_DUTY_MIN  (25)
+
+static int
+sysi_fanctrl_fan_fault_policy(onlp_fan_info_t fi[CHASSIS_FAN_COUNT],
+                              onlp_thermal_info_t ti[CHASSIS_THERMAL_COUNT],
+                              int *adjusted)
+{
+	int i;
+    *adjusted = 0;
+
+    /* Bring fan speed to FAN_DUTY_MAX if any fan is not operational */
+    for (i = 0; i < CHASSIS_FAN_COUNT; i++) {
+        if (!(fi[i].status & ONLP_FAN_STATUS_FAILED)) {
+            continue;
+        }
+
+        *adjusted = 1;
+        return onlp_fani_percentage_set(ONLP_FAN_ID_CREATE(1), FAN_DUTY_MAX);
+    }
+
+    return ONLP_STATUS_OK;
+}
+
+static int 
+sysi_fanctrl_fan_absent_policy(onlp_fan_info_t fi[CHASSIS_FAN_COUNT],
+                               onlp_thermal_info_t ti[CHASSIS_THERMAL_COUNT],
+                               int *adjusted)
+{
+	int i;
+    *adjusted = 0;
+
+    /* Bring fan speed to FAN_DUTY_MAX if fan is not present */
+    for (i = 0; i < CHASSIS_FAN_COUNT; i++) {
+        if (fi[i].status & ONLP_FAN_STATUS_PRESENT) {
+            continue;
+        }
+
+        *adjusted = 1;
+        return onlp_fani_percentage_set(ONLP_FAN_ID_CREATE(1), FAN_DUTY_MAX);
+    }
+
+    return ONLP_STATUS_OK;
+}
+
+static int
+sysi_fanctrl_fan_unknown_speed_policy(onlp_fan_info_t fi[CHASSIS_FAN_COUNT],
+                                      onlp_thermal_info_t ti[CHASSIS_THERMAL_COUNT],
+                                      int *adjusted)
+{
+	int i, match = 0;
+    int fanduty;
+	int legal_duties[] = {FAN_DUTY_MIN, 44, 57, 94, FAN_DUTY_MAX};
+
+	*adjusted = 0;
+
+    if (onlp_file_read_int(&fanduty, FAN_NODE(fan_duty_cycle_percentage)) < 0) {
+        *adjusted = 1;
+        return onlp_fani_percentage_set(ONLP_FAN_ID_CREATE(1), FAN_DUTY_MIN);
+    }    
+
+    /* Bring fan speed to min if current speed is not expected
+     */
+    for (i = 0; i < AIM_ARRAYSIZE(legal_duties); i++) {
+		if (fanduty != legal_duties[i]) {
+			continue;
+		}
+
+		match = 1;
+		break;
+    }
+
+	if (!match) {
+        *adjusted = 1;
+        return onlp_fani_percentage_set(ONLP_FAN_ID_CREATE(1), FAN_DUTY_MIN);
+	}
+
+    return ONLP_STATUS_OK;
+}
+
+static int
+sysi_fanctrl_overall_thermal_sensor_policy(onlp_fan_info_t fi[CHASSIS_FAN_COUNT],
+                                           onlp_thermal_info_t ti[CHASSIS_THERMAL_COUNT],
+                                           int *adjusted)
+{
+    int i, num_of_sensor = 0, temp_avg = 0;
+
+    for (i = (THERMAL_CPU_CORE); i <= (THERMAL_CPU_CORE); i++) {
+        num_of_sensor++;
+        temp_avg += ti[i-1].mcelsius;
+    }
+
+    temp_avg /= num_of_sensor;
+	*adjusted = 1;
+
+    if (temp_avg > 60000) {
+        return onlp_fani_percentage_set(ONLP_FAN_ID_CREATE(1), FAN_DUTY_MAX);
+    }
+    else if (temp_avg > 55000) {
+        return onlp_fani_percentage_set(ONLP_FAN_ID_CREATE(1), 94);
+    }
+    else if (temp_avg > 50000) {
+        return onlp_fani_percentage_set(ONLP_FAN_ID_CREATE(1), 57);
+    }
+    else if (temp_avg > 30000) {
+        return onlp_fani_percentage_set(ONLP_FAN_ID_CREATE(1), 44);
+    }
+
+    return onlp_fani_percentage_set(ONLP_FAN_ID_CREATE(1), FAN_DUTY_MIN);
+}
+
+typedef int (*fan_control_policy)(onlp_fan_info_t fi[CHASSIS_FAN_COUNT],
+                                  onlp_thermal_info_t ti[CHASSIS_THERMAL_COUNT],
+                                  int *adjusted);
+
+fan_control_policy fan_control_policies[] = {
+sysi_fanctrl_fan_fault_policy,
+sysi_fanctrl_fan_absent_policy,
+sysi_fanctrl_fan_unknown_speed_policy,
+sysi_fanctrl_overall_thermal_sensor_policy,
+};
+
 int
 onlp_sysi_platform_manage_fans(void)
 {
-    return ONLP_STATUS_E_UNSUPPORTED;
+    int i, rc;
+    onlp_fan_info_t fi[CHASSIS_FAN_COUNT];
+    onlp_thermal_info_t ti[CHASSIS_THERMAL_COUNT];
+
+    memset(fi, 0, sizeof(fi));
+    memset(ti, 0, sizeof(ti));
+
+    /* Get fan status
+     */
+    for (i = 0; i < CHASSIS_FAN_COUNT; i++) {
+        rc = onlp_fani_info_get(ONLP_FAN_ID_CREATE(i+1), &fi[i]);
+
+        if (rc != ONLP_STATUS_OK) {
+            onlp_fani_percentage_set(ONLP_FAN_ID_CREATE(1), FAN_DUTY_MAX);
+			AIM_LOG_ERROR("Unable to get fan(%d) status\r\n", i+1);
+            return ONLP_STATUS_E_INTERNAL;
+        }
+    }
+
+    /* Get thermal sensor status
+     */
+    for (i = 0; i < THERMAL_CPU_CORE; i++) {
+        rc = onlp_thermali_info_get(ONLP_THERMAL_ID_CREATE(i+1), &ti[i]);
+        
+        if (rc != ONLP_STATUS_OK) {
+            onlp_fani_percentage_set(ONLP_FAN_ID_CREATE(1), FAN_DUTY_MAX);
+			AIM_LOG_ERROR("Unable to get thermal(%d) status\r\n", i+1);
+            return ONLP_STATUS_E_INTERNAL;
+        }
+    }
+
+    /* Apply thermal policy according the policy list,
+     * If fan duty is adjusted by one of the policies, skip the others
+     */
+    for (i = 0; i < AIM_ARRAYSIZE(fan_control_policies); i++) {
+        int adjusted = 0;
+
+        rc = fan_control_policies[i](fi, ti, &adjusted);
+        if (!adjusted) {
+            continue;
+        }
+
+        return rc;
+    }
+
+    return ONLP_STATUS_OK;
 }
 
 int
