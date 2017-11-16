@@ -122,7 +122,7 @@ onlp_sysi_platform_info_free(onlp_platform_info_t* pi)
 }
 
 #define FAN_DUTY_MAX  (100)
-#define FAN_DUTY_MIN  (25)
+#define FAN_DUTY_MIN  (32)
 
 static int
 sysi_fanctrl_fan_fault_policy(onlp_fan_info_t fi[CHASSIS_FAN_COUNT],
@@ -167,46 +167,11 @@ sysi_fanctrl_fan_absent_policy(onlp_fan_info_t fi[CHASSIS_FAN_COUNT],
 }
 
 static int
-sysi_fanctrl_fan_unknown_speed_policy(onlp_fan_info_t fi[CHASSIS_FAN_COUNT],
-                                      onlp_thermal_info_t ti[CHASSIS_THERMAL_COUNT],
-                                      int *adjusted)
-{
-	int i, match = 0;
-    int fanduty;
-	int legal_duties[] = {FAN_DUTY_MIN, 44, 57, 94, FAN_DUTY_MAX};
-
-	*adjusted = 0;
-
-    if (onlp_file_read_int(&fanduty, FAN_NODE(fan_duty_cycle_percentage)) < 0) {
-        *adjusted = 1;
-        return onlp_fani_percentage_set(ONLP_FAN_ID_CREATE(1), FAN_DUTY_MIN);
-    }    
-
-    /* Bring fan speed to min if current speed is not expected
-     */
-    for (i = 0; i < AIM_ARRAYSIZE(legal_duties); i++) {
-		if (fanduty != legal_duties[i]) {
-			continue;
-		}
-
-		match = 1;
-		break;
-    }
-
-	if (!match) {
-        *adjusted = 1;
-        return onlp_fani_percentage_set(ONLP_FAN_ID_CREATE(1), FAN_DUTY_MIN);
-	}
-
-    return ONLP_STATUS_OK;
-}
-
-static int
 sysi_fanctrl_overall_thermal_sensor_policy(onlp_fan_info_t fi[CHASSIS_FAN_COUNT],
                                            onlp_thermal_info_t ti[CHASSIS_THERMAL_COUNT],
                                            int *adjusted)
 {
-    int i, num_of_sensor = 0, temp_avg = 0;
+    int i, num_of_sensor = 0, temp_avg = 0, fanduty;
 
     for (i = (THERMAL_CPU_CORE); i <= (THERMAL_CPU_CORE); i++) {
         num_of_sensor++;
@@ -216,17 +181,34 @@ sysi_fanctrl_overall_thermal_sensor_policy(onlp_fan_info_t fi[CHASSIS_FAN_COUNT]
     temp_avg /= num_of_sensor;
 	*adjusted = 1;
 
-    if (temp_avg > 60000) {
+    if (onlp_file_read_int(&fanduty, FAN_NODE(fan_duty_cycle_percentage)) < 0) {
         return onlp_fani_percentage_set(ONLP_FAN_ID_CREATE(1), FAN_DUTY_MAX);
     }
-    else if (temp_avg > 55000) {
-        return onlp_fani_percentage_set(ONLP_FAN_ID_CREATE(1), 94);
+
+    if (temp_avg > 55000) {
+        if (fanduty == FAN_DUTY_MAX) {
+            return ONLP_STATUS_OK;
+        }
+
+        return onlp_fani_percentage_set(ONLP_FAN_ID_CREATE(1), FAN_DUTY_MAX);
     }
     else if (temp_avg > 50000) {
-        return onlp_fani_percentage_set(ONLP_FAN_ID_CREATE(1), 57);
+        if (fanduty == 63) {
+            return ONLP_STATUS_OK;
+        }
+
+        return onlp_fani_percentage_set(ONLP_FAN_ID_CREATE(1), 63);
     }
     else if (temp_avg > 30000) {
-        return onlp_fani_percentage_set(ONLP_FAN_ID_CREATE(1), 44);
+        if (fanduty == 50) {
+            return ONLP_STATUS_OK;
+        }
+        
+        return onlp_fani_percentage_set(ONLP_FAN_ID_CREATE(1), 50);
+    }
+
+    if (fanduty == FAN_DUTY_MIN) {
+        return ONLP_STATUS_OK;
     }
 
     return onlp_fani_percentage_set(ONLP_FAN_ID_CREATE(1), FAN_DUTY_MIN);
@@ -239,7 +221,6 @@ typedef int (*fan_control_policy)(onlp_fan_info_t fi[CHASSIS_FAN_COUNT],
 fan_control_policy fan_control_policies[] = {
 sysi_fanctrl_fan_fault_policy,
 sysi_fanctrl_fan_absent_policy,
-sysi_fanctrl_fan_unknown_speed_policy,
 sysi_fanctrl_overall_thermal_sensor_policy,
 };
 
