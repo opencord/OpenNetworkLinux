@@ -1,0 +1,4 @@
+source-directory /etc/network/interfaces.d
+
+auto ma1
+iface ma1 inet dhcp
